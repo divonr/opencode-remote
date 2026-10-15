@@ -1,0 +1,4 @@
+.env
+state.json
+inbox/
+__pycache__/
