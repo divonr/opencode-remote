@@ -391,13 +391,84 @@ def fmt_tokens(n: int | None) -> str:
     return str(n)
 
 
+def short_model_name(raw: str | None) -> str:
+    """Short display name for a model id: strip any provider prefix (text
+    before `/` or `:`), then cut at the FIRST occurrence of any of: space,
+    hyphen, slash, or an English CAPITAL letter A-Z (delimiter excluded).
+    Returns "?" for None/empty/unparseable input — the banner never omits
+    the model segment."""
+    if not raw or not isinstance(raw, str):
+        return "?"
+    s = raw.strip()
+    if not s:
+        return "?"
+    # strip provider prefix (text before `/` or `:`). Note: a bare `/` also
+    # doubles as a cut delimiter ("Abc/models"->"Abc"), while a "Provider
+    # Name/model" prefix contains a space ("Experiential Labs/gemini-4-argon"
+    # ->"gemini-4-argon"). So: `:` always strips; `/` strips only when the
+    # prefix contains a space, otherwise the `/` is left for the cut below.
+    if ":" in s:
+        s = s.rsplit(":", 1)[-1].strip()
+        if not s:
+            return "?"
+    if "/" in s:
+        pre, _, post = s.rpartition("/")
+        if " " in pre:
+            s = post.strip()
+            if not s:
+                return "?"
+        # else: keep the `/` — the cut loop below stops at it ("Abc/..."->"Abc")
+    # cut at first delimiter (capitals only count past index 0, so "Abc" stays "Abc")
+    for i in range(1, len(s)):
+        c = s[i]
+        if c in (" ", "-", "/") or ("A" <= c <= "Z"):
+            s = s[:i]
+            break
+    return s or "?"
+
+
+def session_model_from_obj(sess: dict | None) -> str | None:
+    """Extract the raw model id from a GET /session/{id} response object.
+    Returns None when unavailable (caller shows "?"). Never raises."""
+    try:
+        if not isinstance(sess, dict):
+            return None
+        m = sess.get("model")
+        if isinstance(m, dict):
+            mid = m.get("id") or m.get("modelID") or m.get("modelId")
+            if mid:
+                return str(mid)
+        elif isinstance(m, str) and m.strip():
+            return m.strip()
+        for key in ("modelID", "modelId", "model_id"):
+            v = sess.get(key)
+            if v and isinstance(v, str) and v.strip():
+                return v.strip()
+        return None
+    except Exception:
+        return None
+
+
+def session_model_raw(sid: str, directory: str | None) -> str | None:
+    """Resolve the session's CURRENT model id via GET /session/{sid}
+    (field: `model.id`). Returns None on any failure (banner shows "?")."""
+    try:
+        sess = oc_get(f"/session/{sid}", directory)
+        return session_model_from_obj(sess)
+    except Exception as e:
+        log("session model lookup failed:", e)
+        return None
+
+
 def session_banner_text(title: str, sid: str, directory: str | None,
-                        tokens: int | None = None, busy: bool = False) -> str:
-    """📌 [🟢 ]<tokens> | <session title>  (🟢 only while the session is busy)"""
+                        tokens: int | None = None, busy: bool = False,
+                        model: str | None = None) -> str:
+    """📌 [🟢 ][<tokens> | ]<shortModel> | <session title>  (🟢 only while busy)"""
     segs = []
     tok = fmt_tokens(tokens)
     if tok:
         segs.append(tok)
+    segs.append(short_model_name(model))
     segs.append(title)
     return "📌 " + ("🟢 " if busy else "") + " | ".join(segs)
 
@@ -1444,12 +1515,19 @@ def watcher_loop() -> None:
                                  "seen_user": sorted(seen_u)[-500:]})
                 known_session = sid
                 st = state_read()  # re-read: attach_replay just wiped/reset ids
-                # pinned banner with the active session name
+                # pinned banner with the active session name + model
                 try:
-                    title = oc_get(f"/session/{sid}", d).get("title") or "untitled"
+                    _sess = oc_get(f"/session/{sid}", d)
+                    title = _sess.get("title") or "untitled"
+                    _model = session_model_from_obj(_sess)
                 except Exception:
                     title = "untitled"
-                text = session_banner_text(title, sid, d)
+                    _model = None
+                try:
+                    text = session_banner_text(title, sid, d, model=_model)
+                except Exception as e:
+                    log("banner build failed:", e)
+                    text = session_banner_text(title, sid, d)
                 state_write({"session_title": title})
                 if st.get("session_msg_sid") != sid:
                     # different session → replace the banner
@@ -1479,7 +1557,13 @@ def watcher_loop() -> None:
             # 0) keep the pinned banner in sync: title + token count (updated
             #    when the model finishes) + "thinking..." while it works
             try:
-                cur_title = oc_get(f"/session/{sid}", d).get("title") or "untitled"
+                _sess = oc_get(f"/session/{sid}", d)
+                cur_title = _sess.get("title") or "untitled"
+                try:
+                    _model = session_model_from_obj(_sess)
+                except Exception as e:
+                    log("session model lookup failed:", e)
+                    _model = None
                 busy = (oc_get("/session/status", d).get(sid) or {}).get("type") == "busy"
                 tokens = None
                 for m in reversed(msgs):
@@ -1491,7 +1575,7 @@ def watcher_loop() -> None:
                     if tot:
                         tokens = tot
                         break
-                text = session_banner_text(cur_title, sid, d, tokens, busy)
+                text = session_banner_text(cur_title, sid, d, tokens, busy, _model)
                 if text != st.get("session_banner_text"):
                     mid = st.get("session_msg_id")
                     if mid and tg_edit(mid, text):
