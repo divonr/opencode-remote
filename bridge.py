@@ -50,6 +50,7 @@ Markdown ⇄ Telegram formatting (tg_md.py — from the telegram MCP server):
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -288,6 +289,14 @@ def oc_patch(path: str, body: dict, directory: str | None = None):
     return r.json() if r.content else {}
 
 
+def oc_delete(path: str, directory: str | None = None, **params):
+    if directory:
+        params["directory"] = directory
+    r = requests.delete(f"{SERVER}{path}", params=params, timeout=15)
+    r.raise_for_status()
+    return r.json() if r.content else {}
+
+
 def server_alive() -> bool:
     try:
         requests.get(f"{SERVER}/global/health", timeout=5)
@@ -488,6 +497,7 @@ TG_COMMANDS = [
     ("tools", "הדלקה/כיבוי התראות כלים"),
     ("todos", "הדלקה/כיבוי רשימת משימות"),
     ("q", "מענה טקסט חופשי לשאלה פתוחה"),
+    ("model", "החלפת המודל (בחירה / מעבר / ברירת מחדל)"),
     ("remote", "סטטוס/ניתוק הגשר (בטלגרם: attach דרך /sessions)"),
 ]
 
@@ -549,6 +559,9 @@ Attaching (/attach, /new, /remote) wipes this chat and mirrors the session's las
 /tools — toggle tool-call notifications
 /todos — toggle the live todo list
 /q <text> — free-text answer to a pending question
+/model — pick the attached session's model (provider → model buttons)
+/model <provider>/<model> — switch the attached session now (also provider:model or a bare model id)
+/model --config [<provider>/<model>] — show / set the default model for NEW sessions
 /allow · /always · /deny — answer a permission request
 
 Native opencode commands also work here — /init, /compact, /review, /undo…
@@ -709,6 +722,8 @@ def handle_command(text: str) -> str | tuple[str, dict] | None:
             return cmd_new(st, arg)
         if cmd == "dir":
             return cmd_dir(st, arg)
+        if cmd == "model":
+            return cmd_model(st, arg)
         if cmd == "rename":
             sid = st.get("session_id")
             if not sid:
@@ -1087,6 +1102,296 @@ def handle_new_cb(cb: dict, action: str) -> None:
         return
 
 
+# ── Model switching (/model) ──────────────────────────────────────────────
+# List:   GET /config/providers?directory=… → {"providers": [{"id", "models": {mid: …}}], "default": …}
+# Switch: POST /session/{id}/prompt_async {model: {providerID, modelID}, noReply: true, parts: []}
+#         (PATCH /session/{id} only accepts {title}; the session's stored model
+#         follows the last prompt's model, so a no-reply prompt flips it. The
+#         residue textless marker message is deleted best-effort right after.)
+#         Verified via GET /session/{id} → model: {id, providerID, variant}.
+#         The 📌 banner picks the new model up via its text-compare path.
+# Default for NEW sessions: top-level "model" in opencode.jsonc (JSONC — text edit).
+# Picker state lives in state.json["model_browser"]; callbacks are tiny
+# indexes (model:p:<i> / model:m:<pi>:<mi> / model:back) — never full model ids.
+
+OPENCODE_JSONC = Path.home() / ".config" / "opencode" / "opencode.jsonc"
+
+
+def fetch_model_catalog(directory: str | None) -> tuple[list[str], dict[str, list[str]]]:
+    """(providers, models_by_provider) from GET /config/providers.
+    Raises on server/parse failure (caller turns it into a friendly reply)."""
+    data = oc_get("/config/providers", directory)
+    providers: list[str] = []
+    models_by_provider: dict[str, list[str]] = {}
+    for p in data.get("providers") or []:
+        pid = p.get("id")
+        if not pid:
+            continue
+        providers.append(pid)
+        models_by_provider[pid] = sorted((p.get("models") or {}).keys())
+    if not providers:
+        raise RuntimeError("no providers returned by /config/providers")
+    return providers, models_by_provider
+
+
+def _model_candidates(arg: str, providers: list[str],
+                       models_by_provider: dict[str, list[str]], limit: int = 12) -> list[str]:
+    full = [f"{p}/{m}" for p in providers for m in models_by_provider.get(p, [])]
+    close = difflib.get_close_matches(arg, full, n=limit, cutoff=0.4)
+    low = arg.lower()
+    sub = [f for f in full if low in f.lower() and f not in close]
+    return (close + sub)[:limit]
+
+
+def _model_candidates_text(arg: str, providers: list[str],
+                            models_by_provider: dict[str, list[str]]) -> str:
+    cands = _model_candidates(arg, providers, models_by_provider)
+    if not cands:
+        return "no close matches — /model with no args browses all providers."
+    lines = "\n".join(f"• {c}" for c in cands)
+    return f"Did you mean:\n{lines}\n\n/model with no args browses all providers."
+
+
+def resolve_model_arg(arg: str, providers: list[str],
+                      models_by_provider: dict[str, list[str]]
+                      ) -> tuple[str | None, str | None, str | None]:
+    """Parse `<provider>/<model>`, `<provider>:<model>` or a bare `<model>`.
+
+    Returns (providerID, modelID, None) on success, else (None, None, reply)
+    with an ambiguity / miss message including close candidates."""
+    arg = (arg or "").strip()
+    if not arg:
+        return None, None, "Usage: /model <provider>/<model>  (or /model with no args to browse)"
+    for sep in ("/", ":"):
+        if sep in arg:
+            p, _, m = arg.partition(sep)
+            p, m = p.strip(), m.strip()
+            if p in models_by_provider and m in models_by_provider[p]:
+                return p, m, None
+            if p not in models_by_provider:
+                known = ", ".join(providers)
+                return (None, None,
+                        f"⚠️ unknown provider: {p}\nproviders: {known}\n"
+                        + _model_candidates_text(arg, providers, models_by_provider))
+            return (None, None,
+                    f"⚠️ unknown model: {arg}\n"
+                    + _model_candidates_text(arg, providers, models_by_provider))
+    # bare model id: exact match first, then suffix match across providers
+    exact = [(p, m) for p in providers for m in models_by_provider.get(p, []) if m == arg]
+    if len(exact) == 1:
+        return exact[0][0], exact[0][1], None
+    if len(exact) > 1:
+        lines = "\n".join(f"• {p}/{m}" for p, m in exact)
+        return (None, None,
+                f"⚠️ ambiguous model {arg!r} — in {len(exact)} providers, be explicit:\n{lines}")
+    suf = [(p, m) for p in providers for m in models_by_provider.get(p, [])
+           if m.split("/")[-1] == arg or m.endswith("/" + arg)]
+    if len(suf) == 1:
+        return suf[0][0], suf[0][1], None
+    if len(suf) > 1:
+        lines = "\n".join(f"• {p}/{m}" for p, m in suf)
+        return (None, None,
+                f"⚠️ ambiguous model {arg!r} — matches in {len(suf)} providers, be explicit:\n{lines}")
+    return (None, None,
+            f"⚠️ unknown model: {arg}\n" + _model_candidates_text(arg, providers, models_by_provider))
+
+
+def switch_session_model(sid: str, directory: str | None,
+                         provider_id: str, model_id: str) -> None:
+    """Flip a session's stored model via a no-reply prompt, then delete the
+    residue textless marker message best-effort (history stays clean).
+    Raises on switch failure; cleanup failure is only logged."""
+    oc_post(f"/session/{sid}/prompt_async",
+            {"model": {"providerID": provider_id, "modelID": model_id},
+             "noReply": True, "parts": []},
+            directory)
+    try:
+        now_ms = time.time() * 1000
+        msgs = oc_get(f"/session/{sid}/message", directory, limit=10)
+        best: tuple[float, str] | None = None
+        for m in msgs:
+            info = m.get("info") or {}
+            if info.get("role") != "user":
+                continue
+            created = info.get("time", {}).get("created", 0) or 0
+            if now_ms - created > 120_000:
+                continue  # not ours — never touch older messages
+            parts = m.get("parts") or []
+            if any((p.get("text") or "").strip() for p in parts if p.get("type") == "text"):
+                continue
+            if any(p.get("type") == "tool" for p in parts):
+                continue
+            if best is None or created > best[0]:
+                best = (created, info.get("id"))
+        if best and best[1]:
+            oc_delete(f"/session/{sid}/message/{best[1]}", directory)
+    except Exception as e:
+        log("model-switch cleanup failed:", e)
+
+
+def cmd_model_switch(st: dict, arg: str) -> str:
+    sid = st.get("session_id")
+    if not sid:
+        return "🔌 No session attached — /sessions to pick one, or /new."
+    try:
+        providers, models_by_provider = fetch_model_catalog(st.get("directory"))
+    except Exception as e:
+        return f"⚠️ model list failed: {e}"
+    pid, mid, reply = resolve_model_arg(arg, providers, models_by_provider)
+    if reply:
+        return reply
+    try:
+        switch_session_model(sid, st.get("directory"), pid, mid)
+    except Exception as e:
+        return f"⚠️ model switch failed: {e}"
+    full = f"{pid}/{mid}"
+    return (f"🔀 model switched: {short_model_name(full)} ({full})\n"
+            "📌 banner updates in a few seconds.")
+
+
+def cmd_model_picker(st: dict) -> tuple[str, dict | None]:
+    """Bare /model: provider picker (model list on next tap)."""
+    try:
+        providers, models_by_provider = fetch_model_catalog(st.get("directory"))
+    except Exception as e:
+        return f"⚠️ model list failed: {e}", None
+    state_write({"model_browser": {"providers": providers,
+                                   "models_by_provider": models_by_provider}})
+    rows = [[{"text": p, "callback_data": f"model:p:{i}"}]
+            for i, p in enumerate(providers)]
+    return "🔀 pick a provider:", {"inline_keyboard": rows}
+
+
+def model_providers_kb(brow: dict) -> dict:
+    rows = [[{"text": p, "callback_data": f"model:p:{i}"}]
+            for i, p in enumerate(brow.get("providers") or [])]
+    return {"inline_keyboard": rows}
+
+
+def model_models_kb(brow: dict, pi: int) -> tuple[str, dict]:
+    p = brow["providers"][pi]
+    models = (brow.get("models_by_provider") or {}).get(p, [])
+    rows = [[{"text": m[:60], "callback_data": f"model:m:{pi}:{mi}"}]
+            for mi, m in enumerate(models)]
+    rows.append([{"text": "⬅️ providers", "callback_data": "model:back"}])
+    return p, {"inline_keyboard": rows}
+
+
+def handle_model_cb(cb: dict, data: str) -> None:
+    """model:p:<i> → model list; model:m:<pi>:<mi> → switch now; model:back → providers."""
+    parts = data.split(":")
+    kind = parts[1] if len(parts) > 1 else ""
+    cbid = cb.get("id", "")
+    mid = (cb.get("message") or {}).get("message_id")
+    brow = dict(state_read().get("model_browser") or {})
+    if not brow or not brow.get("providers"):
+        tg_answer_cb(cbid, "browser expired — run /model again")
+        if mid:
+            tg_edit_kb(mid, "⌛ model browser expired — run /model again.")
+        return
+    try:
+        if kind == "back":
+            tg_answer_cb(cbid)
+            if mid:
+                tg_edit_kb(mid, "🔀 pick a provider:", model_providers_kb(brow))
+            return
+        if kind == "p":
+            pi = int(parts[2])
+            p, kb = model_models_kb(brow, pi)
+            tg_answer_cb(cbid, p[:190])
+            if mid:
+                tg_edit_kb(mid, f"🔀 {p} — pick a model:", kb)
+            return
+        if kind == "m":
+            pi, mi = int(parts[2]), int(parts[3])
+            p = brow["providers"][pi]
+            m = (brow.get("models_by_provider") or {}).get(p, [])[mi]
+            st = state_read()
+            sid = st.get("session_id")
+            if not sid:
+                tg_answer_cb(cbid, "⚠️ not attached")
+                if mid:
+                    tg_edit_kb(mid, "🔌 No session attached — /sessions to pick one, or /new.")
+                return
+            switch_session_model(sid, st.get("directory"), p, m)
+            state_write({"model_browser": None})
+            full = f"{p}/{m}"
+            tg_answer_cb(cbid, f"🔀 {short_model_name(full)}")
+            if mid:
+                tg_edit_kb(mid, f"🔀 model switched: {short_model_name(full)} ({full})\n"
+                                "📌 banner updates in a few seconds.")
+            return
+    except (ValueError, IndexError):
+        tg_answer_cb(cbid, "⚠️ list changed — run /model again")
+        return
+    except Exception as e:
+        tg_answer_cb(cbid, "⚠️ failed")
+        if mid:
+            tg_edit_kb(mid, f"⚠️ model switch failed: {e}")
+        return
+    tg_answer_cb(cbid)
+
+
+def cmd_model_config_show() -> str:
+    try:
+        raw = OPENCODE_JSONC.read_text()
+    except Exception as e:
+        return f"⚠️ model config read failed: {e}"
+    m = re.search(r'"model"\s*:\s*"([^"]+)"', raw)
+    if m:
+        return ("⚙️ default model for NEW sessions: " + m.group(1) +
+                "\n(/model --config <provider>/<model> to change)")
+    return "⚙️ no top-level \"model\" set — new sessions use the server default."
+
+
+def cmd_model_config_set(spec: str) -> str:
+    try:
+        providers, models_by_provider = fetch_model_catalog(state_read().get("directory"))
+    except Exception as e:
+        return f"⚠️ model list failed: {e}"
+    pid, mid, reply = resolve_model_arg(spec, providers, models_by_provider)
+    if reply:
+        return reply
+    full = f"{pid}/{mid}"
+    try:
+        raw = OPENCODE_JSONC.read_text()
+    except Exception as e:
+        return f"⚠️ model config read failed: {e}"
+    bak = OPENCODE_JSONC.with_name(f"opencode.jsonc.bak-model-{int(time.time())}")
+    try:
+        bak.write_text(raw)
+    except Exception as e:
+        return f"⚠️ model config backup failed: {e}"
+    # replace the top-level "model" line (shallowest indent wins — never a nested key),
+    # or insert after the opening brace when the key is missing
+    found = sorted(re.finditer(r'^([ \t]*)"model"\s*:\s*"[^"]*"', raw, re.M),
+                   key=lambda m: len(m.group(1)))
+    if found:
+        t = found[0]
+        new_raw = raw[:t.start()] + f'{t.group(1)}"model": "{full}"' + raw[t.end():]
+    else:
+        new_raw = raw.replace("{", "{\n  \"model\": \"" + full + "\",", 1)
+    try:
+        OPENCODE_JSONC.write_text(new_raw)
+    except Exception as e:
+        return f"⚠️ model config write failed: {e}"
+    return (f"⚙️ default model for NEW sessions: {full}\n"
+            f"(backup: {bak.name}; current session untouched — /model {full} to switch it)")
+
+
+def cmd_model(st: dict, arg: str) -> str | tuple[str, dict] | None:
+    """Three forms: bare → provider picker; <spec> → switch now;
+    --config [...] → show/set the default for NEW sessions."""
+    if not arg:
+        return cmd_model_picker(st)
+    if arg == "--config" or arg.startswith("--config "):
+        rest = arg[len("--config"):].strip()
+        if not rest:
+            return cmd_model_config_show()
+        return cmd_model_config_set(rest)
+    return cmd_model_switch(st, arg)
+
+
 # ── Telegram inbound loop ─────────────────────────────────────────────────
 
 PERM_LABELS = {"once": "✅ Once", "always": "🟢 Always", "reject": "🚫 Denied"}
@@ -1152,6 +1457,9 @@ def handle_callback(cb: dict) -> None:
         return
     if data.startswith("new:"):
         handle_new_cb(cb, data.split(":", 1)[1])
+        return
+    if data.startswith("model:"):
+        handle_model_cb(cb, data)
         return
     if not data.startswith("perm:"):
         return
@@ -1463,6 +1771,7 @@ def detach_cleanup() -> None:
                  "session_title": None, "session_banner_text": None,
                  "todo_msg_id": None, "todo_hash": None, "todo_pinned": False,
                  "pending_perm": None, "pending_new": None, "dir_browser": None,
+                 "model_browser": None,
                  "pending_qs": {}, "children": [], "children_initialized": False})
 
 
@@ -1889,6 +2198,7 @@ def _reset_telegram_state_on_token_change() -> None:
         "notified_perms": [],
         "pending_new": None,
         "dir_browser": None,
+        "model_browser": None,
     })
 
 
